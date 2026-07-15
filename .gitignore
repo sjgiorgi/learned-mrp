@@ -1,0 +1,18 @@
+# data files -- large CSVs, never committed
+data/
+results/
+*.csv
+
+# reference/source material -- large data files, draft docx (incl.
+# unpublished peer reviews), images; not part of this project's code
+post_strat_nn/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor / tooling
+.DS_Store
+.claude/
