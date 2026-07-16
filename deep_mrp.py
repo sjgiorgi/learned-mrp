@@ -155,7 +155,7 @@ class PostStratify(nn.Module):
     """
 
     def __init__(self, in_dim: int, d: int = 64, mode: str = "learned",
-                 use_reliability: bool = True):
+                 use_reliability: bool = True, dropout: float = 0.1):
         super().__init__()
         self.mode = mode
         self.use_reliability = use_reliability
@@ -164,6 +164,17 @@ class PostStratify(nn.Module):
             self.q_proj = nn.Linear(in_dim, d)
             self.k_proj = nn.Linear(in_dim, d)
             self.scale = d ** 0.5
+            # d=64 gives this step ~3.3k params (more than the MR step's MLP
+            # at the same default hidden size) with NOTHING to regularize it
+            # before this -- a likely source of the overfitting this ablation
+            # cell shows on small area-level training sets. proj_dropout on
+            # q/k mirrors standard attention-layer dropout; attn_dropout on
+            # the post-softmax weights is standard attention-weight dropout.
+            # Both are inverted dropout (PyTorch default), so the downstream
+            # w.sum()-normalisation in DeepMRP.forward_area stays correct
+            # under whatever weights a given dropout draw actually produces.
+            self.proj_dropout = nn.Dropout(dropout)
+            self.attn_dropout = nn.Dropout(dropout)
             if use_reliability:
                 # reliability enters the logit additively (log-space multiplier)
                 self.rel_proj = nn.Linear(1, 1)
@@ -187,8 +198,8 @@ class PostStratify(nn.Module):
 
         # learned P: attention with population-mismatch query
         mismatch = (census_enc - sample_enc)                       # (in_dim,)
-        q = self.q_proj(mismatch)                                  # (d,)
-        k = self.k_proj(user_cell_enc)                             # (u, d)
+        q = self.proj_dropout(self.q_proj(mismatch))                # (d,)
+        k = self.proj_dropout(self.k_proj(user_cell_enc))           # (u, d)
         logits = (k @ q) / self.scale                              # (u,)
 
         if self.use_reliability and batch.user_reliability is not None:
@@ -196,7 +207,8 @@ class PostStratify(nn.Module):
             logits = logits + self.rel_proj(rel).squeeze(-1)       # (u,)
 
         alpha = torch.softmax(logits, dim=0)                       # (u,) sums to 1
-        w = alpha * u                                              # sums to u
+        alpha = self.attn_dropout(alpha)                           # attention-weight dropout
+        w = alpha * u                                              # sums to u (in expectation)
         # effective sample size implied by the weights (Kish) -- exposed for the
         # uncertainty / "30 good vs 30 bad users" analyses.
         n_eff = (w.sum() ** 2) / (w.pow(2).sum() + 1e-9)
@@ -219,7 +231,7 @@ class DeepMRP(nn.Module):
     def __init__(self, marg_dim: int, cross_dim: Optional[int] = None,
                  cell_space: str = "marginal",
                  mr_mode: str = "deep", p_mode: str = "learned",
-                 hidden: int = 64, depth: int = 2, d_attn: int = 64,
+                 hidden: int = 64, depth: int = 2, d_attn: int = 32,
                  dropout: float = 0.1, pool: bool = True,
                  use_reliability: bool = True):
         super().__init__()
@@ -230,7 +242,7 @@ class DeepMRP(nn.Module):
 
         self.mr = MultilevelRegression(in_dim, hidden, depth, mr_mode,
                                        dropout, pool)
-        self.ps = PostStratify(in_dim, d_attn, p_mode, use_reliability)
+        self.ps = PostStratify(in_dim, d_attn, p_mode, use_reliability, dropout)
         self.mr_mode, self.p_mode = mr_mode, p_mode
 
     # -- encoding selector ---------------------------------------------------- #
