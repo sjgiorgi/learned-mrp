@@ -48,8 +48,8 @@ from size_bias_grid import run_grid, summarize
 DATA_DIR = "data"
 OUT_DIR = "results"
 
-SIZES = (0.02, 0.05, 0.15, 0.5)
-BIASES = (0.0, 1.0, 3.0)
+DEFAULT_SIZES = (0.02, 0.05, 0.15, 0.5)
+DEFAULT_BIASES = (0.0, 1.0, 3.0)
 
 ALL_DEMOGRAPHICS = ["age", "inc", "gen", "edu"]
 TWITTER_BINS = {
@@ -86,6 +86,15 @@ def parse_args():
         description="Full size x bias x outcome analysis with configurable k-fold CV.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--sizes", nargs="+", type=float, default=list(DEFAULT_SIZES),
+                    help="sample-size fractions to sweep. Use '--sizes 1.0' (with --biases 0.0) "
+                         "for NO additional subsampling -- the full biased sample as-is, which is "
+                         "what paper reproduction needs (the size/bias grid answers a different "
+                         "question: how methods degrade under EXTRA sparsity/bias on top of what "
+                         "the data already has)")
+    p.add_argument("--biases", nargs="+", type=float, default=list(DEFAULT_BIASES),
+                    help="selection-bias strengths to sweep. 0.0 = representative subsample, "
+                         "no extra induced bias beyond what's already in the data")
     p.add_argument("--outcomes", nargs="+", choices=list(OUTCOME_LOOKUP), default=list(OUTCOME_LOOKUP),
                     help="which Gallup outcomes to run")
     p.add_argument("--demographics", nargs="+", choices=ALL_DEMOGRAPHICS, default=ALL_DEMOGRAPHICS,
@@ -136,9 +145,12 @@ def main():
 
     cv_folds = args.cv_folds if args.cv_folds > 0 else None
     seeds = tuple(range(args.rounds))
+    sizes = tuple(args.sizes)
+    biases = tuple(args.biases)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}", flush=True)
+    print(f"sizes: {sizes}  biases: {biases}", flush=True)
     print(f"outcomes: {args.outcomes}", flush=True)
     print(f"demographics: {demographics}", flush=True)
     print(f"methods: classical={include_classical} (naive/raking/mrp) "
@@ -146,11 +158,11 @@ def main():
     print(f"cv_folds={cv_folds}  rounds={args.rounds} (seeds={seeds})  "
           f"loss_type={args.loss_type}", flush=True)
 
-    n_cells = len(SIZES) * len(BIASES) * len(outcome_pairs) * len(seeds)
+    n_cells = len(sizes) * len(biases) * len(outcome_pairs) * len(seeds)
     n_neural_methods = len(deepmrp_configs) + (1 if include_legacy else 0)
     effective_folds = cv_folds if cv_folds else 1
     n_trainings = n_cells * effective_folds * n_neural_methods
-    print(f"grid: {len(SIZES)} sizes x {len(BIASES)} biases x {len(outcome_pairs)} "
+    print(f"grid: {len(sizes)} sizes x {len(biases)} biases x {len(outcome_pairs)} "
           f"outcomes x {len(seeds)} round(s) = {n_cells} cells "
           f"-> ~{n_trainings} total neural trainings", flush=True)
 
@@ -173,7 +185,7 @@ def main():
 
         df = run_grid(
             pop_df, dem_cols, ps_frames, device,
-            sizes=SIZES, biases=BIASES, seeds=seeds,
+            sizes=sizes, biases=biases, seeds=seeds,
             deepmrp_configs=deepmrp_configs,
             include_classical=include_classical, include_deep=include_deep,
             include_legacy=include_legacy,
