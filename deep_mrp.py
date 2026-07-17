@@ -188,11 +188,29 @@ class PostStratify(nn.Module):
         u = user_cell_enc.shape[0]
 
         if self.mode == "census":
-            # classical P: weight_i = census_frac(cell_i) / sample_frac(cell_i)
-            # implemented via the per-user cell encoding dotted with the ratio.
+            # classical P: weight_i = P_census(joint cell_i) / P_sample(joint cell_i),
+            # joint approximated (independence assumption, same one adapter.py's
+            # build_ps_frame uses for the mrp/raking baselines) as the PRODUCT of
+            # per-demographic marginal ratios -- NOT their sum. In marginal
+            # cell_space, user_cell_enc is multi-hot (one active bin per
+            # demographic, e.g. 4 active positions for 4 demographics), so a
+            # plain dot-product-sum over those positions adds the marginal
+            # ratios together, which isn't a valid joint reweighting factor.
+            # Computing in log-space turns that same sum into a sum-of-logs,
+            # i.e. a product once exponentiated -- log(a*b*c*d) = log a+log b+
+            # log c+log d -- so this reuses the existing multi-hot selection
+            # mechanism unchanged and only touches the values it operates on.
+            # Also the standard numerical-stability trick for multiplying
+            # several ratios that can individually be extreme (near-zero
+            # sample_frac blows up an individual ratio term). In cell_space=
+            # 'crossed', user_cell_enc is one-hot (single active position), so
+            # this is exactly equivalent to the old sum-based formula there --
+            # this is a strict fix for marginal space, not a behavior change
+            # for crossed space.
             ratio = census_enc / (sample_enc + 1e-9)               # (in_dim,)
-            w = (user_cell_enc * ratio).sum(-1)                    # (u,)
-            w = torch.clamp(w, min=1e-6)
+            log_ratio = torch.log(ratio.clamp(min=1e-9))           # (in_dim,)
+            w = torch.exp((user_cell_enc * log_ratio).sum(-1))     # (u,) = product of active ratios
+            w = torch.clamp(w, min=1e-6, max=1e6)
             w = w / w.sum() * u
             return w, {}
 
