@@ -37,6 +37,7 @@ from deep_mrp import DeepMRP, ablation_config
 from featurize import build_area_batches, infer_dims
 from train_deepmrp import train_deepmrp, set_seed
 from ps_nn_legacy import PS_NN, infer_num_factors, train_ps_nn_legacy
+from hybrid_mrp import HybridMRP, train_hybrid_mrp
 
 
 # --------------------------------------------------------------------------- #
@@ -313,6 +314,45 @@ def eval_ps_nn_legacy(samp_df, full_truth, areas, demographics, ps_frames, devic
     return est, held_out
 
 
+def eval_hybrid_mrp(samp_df, full_truth, areas, demographics, ps_frames, device,
+                    seed=0, y_col="y", epochs=100,
+                    precomputed=None, split=None, loss_type="pearson"):
+    """DeepMRP's MultilevelRegression (MR) + ps_nn_legacy's informed-smoothing
+    weighting (P), jointly trained -- see hybrid_mrp.py. Same held-out
+    discipline and precomputed/split sharing as eval_deepmrp/eval_ps_nn_legacy."""
+    set_seed(seed)
+    if precomputed is not None:
+        batches, legacy_areas, kept = precomputed
+    else:
+        batches, legacy_areas, kept = _featurize_from_df(samp_df, areas, demographics,
+                                                          ps_frames, device, y_col=y_col)
+    if len(kept) < 6:
+        return {a: np.nan for a in areas}, kept
+    y = np.array([full_truth[a] for a in kept])
+    marg_dim, _ = infer_dims(batches)
+
+    if split is not None:
+        tr_idx, val_idx = split
+    else:
+        n = len(kept)
+        perm = np.random.RandomState(seed).permutation(n)
+        n_val = max(2, int(0.2 * n))
+        val_idx, tr_idx = perm[:n_val], perm[n_val:]
+    tr_b = [batches[i] for i in tr_idx]; tr_la = [legacy_areas[i] for i in tr_idx]; tr_y = y[tr_idx]
+    va_b = [batches[i] for i in val_idx]; va_la = [legacy_areas[i] for i in val_idx]; va_y = y[val_idx]
+
+    model = HybridMRP(marg_dim=marg_dim, num_dem=len(demographics))
+    model, _ = train_hybrid_mrp(model, tr_b, tr_la, tr_y, va_b, va_la, va_y, device,
+                                epochs=epochs, patience=12, seed=seed,
+                                loss_type=loss_type)
+    model.eval()
+    with torch.no_grad():
+        preds = model(va_b, va_la).cpu().numpy()
+    held_out = [kept[i] for i in val_idx]
+    est = {a: float(preds[i]) for i, a in enumerate(held_out)}
+    return est, held_out
+
+
 # --------------------------------------------------------------------------- #
 #  The grid
 # --------------------------------------------------------------------------- #
@@ -325,6 +365,7 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                               "learned_p", "full_deep_mrp"),
              y_col="y", bias_target=None,
              include_classical=True, include_deep=True, include_legacy=True,
+             include_hybrid=True,
              area_target: Optional[Dict] = None,
              loss_type: str = "pearson",
              cv_folds: Optional[int] = None) -> pd.DataFrame:
@@ -367,7 +408,7 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
         records.append(dict(size=size, bias=bias, seed=seed,
                             method=name, r=r, mse=mse, n=int(mask.sum())))
 
-    needs_split = include_deep or include_legacy
+    needs_split = include_deep or include_legacy or include_hybrid
 
     for size in sizes:
         for bias in biases:
@@ -399,6 +440,7 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                 eval_areas = areas
                 deep_est = {cfg: {} for cfg in deepmrp_configs}
                 legacy_est = {}
+                hybrid_est = {}
 
                 if needs_split:
                     precomputed = _featurize_from_df(samp, areas, demographics,
@@ -436,6 +478,14 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                                     precomputed=precomputed, split=(tr_idx, val_idx),
                                     loss_type=loss_type)
                                 legacy_est.update(est_map)
+
+                            if include_hybrid:
+                                est_map, _ = eval_hybrid_mrp(
+                                    samp, truth_arr, areas, demographics, ps_frames,
+                                    device, seed=fold_seed, y_col=y_col,
+                                    precomputed=precomputed, split=(tr_idx, val_idx),
+                                    loss_type=loss_type)
+                                hybrid_est.update(est_map)
                     else:
                         precomputed = None  # too few areas to train; fall back
 
@@ -457,6 +507,10 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                 if include_legacy and precomputed is not None:
                     est_arr = [legacy_est.get(a, np.nan) for a in eval_areas]
                     score("ps_nn_legacy", est_arr, eval_areas, size, bias, seed)
+
+                if include_hybrid and precomputed is not None:
+                    est_arr = [hybrid_est.get(a, np.nan) for a in eval_areas]
+                    score("hybrid_mrp", est_arr, eval_areas, size, bias, seed)
 
     return pd.DataFrame.from_records(records)
 

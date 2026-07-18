@@ -78,7 +78,7 @@ OUTCOME_LOOKUP = {
 }
 
 DEEPMRP_METHOD_NAMES = ("classical_mrp", "learned_mr", "learned_p", "full_deep_mrp")
-ALL_METHODS = ("naive", "raking", "mrp") + DEEPMRP_METHOD_NAMES + ("ps_nn_legacy",)
+ALL_METHODS = ("naive", "raking", "mrp") + DEEPMRP_METHOD_NAMES + ("ps_nn_legacy", "hybrid_mrp")
 
 
 def parse_args():
@@ -142,6 +142,7 @@ def main():
     deepmrp_configs = tuple(m for m in DEEPMRP_METHOD_NAMES if m in args.methods)
     include_deep = len(deepmrp_configs) > 0
     include_legacy = "ps_nn_legacy" in args.methods
+    include_hybrid = "hybrid_mrp" in args.methods
 
     cv_folds = args.cv_folds if args.cv_folds > 0 else None
     seeds = tuple(range(args.rounds))
@@ -154,12 +155,13 @@ def main():
     print(f"outcomes: {args.outcomes}", flush=True)
     print(f"demographics: {demographics}", flush=True)
     print(f"methods: classical={include_classical} (naive/raking/mrp) "
-          f"deepmrp_configs={deepmrp_configs} ps_nn_legacy={include_legacy}", flush=True)
+          f"deepmrp_configs={deepmrp_configs} ps_nn_legacy={include_legacy} "
+          f"hybrid_mrp={include_hybrid}", flush=True)
     print(f"cv_folds={cv_folds}  rounds={args.rounds} (seeds={seeds})  "
           f"loss_type={args.loss_type}", flush=True)
 
     n_cells = len(sizes) * len(biases) * len(outcome_pairs) * len(seeds)
-    n_neural_methods = len(deepmrp_configs) + (1 if include_legacy else 0)
+    n_neural_methods = len(deepmrp_configs) + (1 if include_legacy else 0) + (1 if include_hybrid else 0)
     effective_folds = cv_folds if cv_folds else 1
     n_trainings = n_cells * effective_folds * n_neural_methods
     print(f"grid: {len(sizes)} sizes x {len(biases)} biases x {len(outcome_pairs)} "
@@ -188,7 +190,7 @@ def main():
             sizes=sizes, biases=biases, seeds=seeds,
             deepmrp_configs=deepmrp_configs,
             include_classical=include_classical, include_deep=include_deep,
-            include_legacy=include_legacy,
+            include_legacy=include_legacy, include_hybrid=include_hybrid,
             cv_folds=cv_folds, loss_type=args.loss_type,
             area_target=area_target,
         )

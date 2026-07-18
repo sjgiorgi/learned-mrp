@@ -49,6 +49,40 @@ class PS_NN(nn.Module):
         self.smoothing2 = nn.Parameter(torch.full((num_dem,), 10.0))
         self.fc1 = nn.Linear(num_factors, 1)
 
+    def compute_weights(self, area: Dict) -> torch.Tensor:
+        """The P step alone, for ONE county: informed smoothing -> masked L1
+        distance -> fc1 -> softmax -> weights (u,). Factored out of forward()
+        so other models (e.g. hybrid_mrp.py) can reuse this exact weighting
+        mechanism with a different per-user prediction than raw user_scores.
+
+        area: per-county dict with keys:
+             census_bin_percents  [ (k_d,) per demographic, sums to 1 ]
+             twitter_bin_counts   [ (k_d,) per demographic, RAW sample counts ]
+             user_dem_embeddings  [ (u, k_d) one-hot per demographic ]
+        """
+        census_bin_percents = area["census_bin_percents"]
+        twitter_bin_counts = area["twitter_bin_counts"]
+        user_dems = area["user_dem_embeddings"]
+
+        twitter_bin_percents = []
+        for i in range(self.num_dem):
+            sm = self.smoothing[i]
+            sm2 = self.smoothing2[i]
+            k_d = twitter_bin_counts[i].shape[0]
+            denom = twitter_bin_counts[i].sum() + sm * k_d
+            pct = (twitter_bin_counts[i] + sm * census_bin_percents[i]) / denom
+            pct = torch.sigmoid(sm2 * pct)
+            twitter_bin_percents.append(pct)
+
+        census_encoding = torch.cat(census_bin_percents, dim=0)      # (num_factors,)
+        twitter_encoding = torch.cat(twitter_bin_percents, dim=0)    # (num_factors,)
+        user_encodings = torch.cat(user_dems, dim=1)                 # (u, num_factors)
+
+        user_features = torch.abs(twitter_encoding - census_encoding) * user_encodings
+        user_features = self.fc1(user_features).squeeze(-1)         # (u,)
+        user_weights = F.softmax(user_features, dim=0) * user_features.shape[0]
+        return user_weights
+
     def forward(self, legacy_areas: List[Dict]) -> torch.Tensor:
         """legacy_areas: list of per-county dicts with keys:
              user_scores          (u,)
@@ -58,30 +92,8 @@ class PS_NN(nn.Module):
         """
         county_weighted_avgs = []
         for area in legacy_areas:
-            user_scores = area["user_scores"]
-            census_bin_percents = area["census_bin_percents"]
-            twitter_bin_counts = area["twitter_bin_counts"]
-            user_dems = area["user_dem_embeddings"]
-
-            twitter_bin_percents = []
-            for i in range(self.num_dem):
-                sm = self.smoothing[i]
-                sm2 = self.smoothing2[i]
-                k_d = twitter_bin_counts[i].shape[0]
-                denom = twitter_bin_counts[i].sum() + sm * k_d
-                pct = (twitter_bin_counts[i] + sm * census_bin_percents[i]) / denom
-                pct = torch.sigmoid(sm2 * pct)
-                twitter_bin_percents.append(pct)
-
-            census_encoding = torch.cat(census_bin_percents, dim=0)      # (num_factors,)
-            twitter_encoding = torch.cat(twitter_bin_percents, dim=0)    # (num_factors,)
-            user_encodings = torch.cat(user_dems, dim=1)                 # (u, num_factors)
-
-            user_features = torch.abs(twitter_encoding - census_encoding) * user_encodings
-            user_features = self.fc1(user_features).squeeze(-1)         # (u,)
-            user_weights = F.softmax(user_features, dim=0) * user_features.shape[0]
-
-            county_weighted_avg = (user_weights * user_scores).sum() / user_weights.sum()
+            user_weights = self.compute_weights(area)
+            county_weighted_avg = (user_weights * area["user_scores"]).sum() / user_weights.sum()
             county_weighted_avgs.append(county_weighted_avg)
 
         return torch.stack(county_weighted_avgs)
