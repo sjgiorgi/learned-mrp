@@ -68,7 +68,7 @@ def train_hybrid_mrp(
     train_batches: List[AreaBatch], train_legacy: List[Dict], y_train: np.ndarray,
     val_batches: List[AreaBatch], val_legacy: List[Dict], y_val: np.ndarray,
     device: torch.device,
-    epochs: int = 100, lr: float = 1e-2, ps_lr: float = 0.5,
+    epochs: int = 100, lr: float = 0.5, ps_lr: float = 0.5,
     weight_decay: float = 1e-4,
     patience: int = 15, loss_type: str = "pearson", seed: int = 0,
 ) -> Tuple[HybridMRP, dict]:
@@ -77,14 +77,17 @@ def train_hybrid_mrp(
     matching DeepMRP's (more modern) training loop rather than ps_nn_legacy's
     notebook-era one, since this model's MR half is DeepMRP's.
 
-    Two learning rates, not one: the MR half (model.mr) trains at DeepMRP's
-    usual scale (lr, default 1e-2), but the P half (model.ps) is literally
-    ps_nn_legacy's smoothing+fc1 parameters, which we already established
-    empirically need a ~50x larger LR (0.5, matching train_ps_nn_legacy's own
-    default) to actually converge within a comparable epoch budget -- a
-    single shared optimizer at DeepMRP's LR would leave the smoothing
-    constants stuck near their initialization, undertrained relative to how
-    ps_nn_legacy is trained standalone."""
+    Still two parameter groups (model.mr at lr, model.ps at ps_lr) so they
+    CAN be split again later, but both default to 0.5 -- the only learning
+    rate we have direct evidence for in this codebase (train_ps_nn_legacy's
+    own default, confirmed empirically to matter: lr=0.1 measurably
+    underperformed lr=0.5 on the same reproduction check). DeepMRP's usual
+    1e-2 for the MR step was never itself validated as optimal, just
+    inherited from DeepMRP's original setup. Note this means model.mr trains
+    at a DIFFERENT rate here than it does in every other DeepMRP config
+    (which use train_deepmrp's 1e-2), so hybrid_mrp vs. full_deep_mrp is no
+    longer a comparison that isolates JUST the P-step swap -- worth knowing
+    when interpreting results, not just an implementation detail."""
     set_seed(seed)
     model = model.to(device)
     opt = torch.optim.AdamW([
