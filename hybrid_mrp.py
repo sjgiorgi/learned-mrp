@@ -68,16 +68,29 @@ def train_hybrid_mrp(
     train_batches: List[AreaBatch], train_legacy: List[Dict], y_train: np.ndarray,
     val_batches: List[AreaBatch], val_legacy: List[Dict], y_val: np.ndarray,
     device: torch.device,
-    epochs: int = 100, lr: float = 1e-2, weight_decay: float = 1e-4,
+    epochs: int = 100, lr: float = 1e-2, ps_lr: float = 0.5,
+    weight_decay: float = 1e-4,
     patience: int = 15, loss_type: str = "pearson", seed: int = 0,
 ) -> Tuple[HybridMRP, dict]:
     """Same discipline as train_deepmrp: gradients only touch the train split,
     val is used solely to pick the best checkpoint. AdamW + cosine schedule,
     matching DeepMRP's (more modern) training loop rather than ps_nn_legacy's
-    notebook-era one, since this model's MR half is DeepMRP's."""
+    notebook-era one, since this model's MR half is DeepMRP's.
+
+    Two learning rates, not one: the MR half (model.mr) trains at DeepMRP's
+    usual scale (lr, default 1e-2), but the P half (model.ps) is literally
+    ps_nn_legacy's smoothing+fc1 parameters, which we already established
+    empirically need a ~50x larger LR (0.5, matching train_ps_nn_legacy's own
+    default) to actually converge within a comparable epoch budget -- a
+    single shared optimizer at DeepMRP's LR would leave the smoothing
+    constants stuck near their initialization, undertrained relative to how
+    ps_nn_legacy is trained standalone."""
     set_seed(seed)
     model = model.to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    opt = torch.optim.AdamW([
+        {"params": model.mr.parameters(), "lr": lr},
+        {"params": model.ps.parameters(), "lr": ps_lr},
+    ], weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     yt = torch.tensor(np.asarray(y_train), dtype=torch.float32, device=device)
