@@ -428,9 +428,13 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
     for size in sizes:
         for bias in biases:
             for seed in seeds:
+                print(f"[grid] size={size} bias={bias} seed={seed}: subsampling...",
+                      flush=True)
                 rng = np.random.default_rng(1000 * seed + int(100 * bias))
                 samp = subsample(pop_df, demographics, size, bias, rng,
                                  bias_target=bias_target)
+                print(f"[grid] size={size} bias={bias} seed={seed}: "
+                      f"{len(samp)} rows sampled", flush=True)
                 if len(samp) < 10:
                     continue
 
@@ -458,9 +462,14 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                 hybrid_est = {}
 
                 if needs_split:
+                    print(f"[grid] size={size} bias={bias} seed={seed}: "
+                          f"featurizing (grouping {len(samp)} rows by area)...",
+                          flush=True)
                     precomputed = _featurize_from_df(samp, areas, demographics,
                                                       ps_frames, device, y_col=y_col)
                     kept = precomputed[2]
+                    print(f"[grid] size={size} bias={bias} seed={seed}: "
+                          f"{len(kept)} areas kept for train/val", flush=True)
                     min_needed = max(6, 2 * cv_folds) if cv_folds else 6
                     if len(kept) >= min_needed:
                         if cv_folds is None:
@@ -487,12 +496,17 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                                     deep_est[cfg].update(est_map)
 
                             if include_legacy:
+                                print(f"[grid] size={size} bias={bias} seed={seed} "
+                                      f"fold={fold_i}: training ps_nn_legacy...",
+                                      flush=True)
                                 est_map, _ = eval_ps_nn_legacy(
                                     samp, truth_arr, areas, demographics, ps_frames,
                                     device, seed=fold_seed, y_col=y_col,
                                     precomputed=precomputed, split=(tr_idx, val_idx),
                                     loss_type=loss_type)
                                 legacy_est.update(est_map)
+                                print(f"[grid] size={size} bias={bias} seed={seed} "
+                                      f"fold={fold_i}: ps_nn_legacy done", flush=True)
 
                             if include_hybrid:
                                 est_map, _ = eval_hybrid_mrp(
@@ -505,11 +519,17 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                         precomputed = None  # too few areas to train; fall back
 
                 if include_classical:
+                    print(f"[grid] size={size} bias={bias} seed={seed}: "
+                          f"scoring naive...", flush=True)
                     score("naive", eval_naive(samp, eval_areas, y_col),
                           eval_areas, size, bias, seed)
+                    print(f"[grid] size={size} bias={bias} seed={seed}: "
+                          f"scoring raking...", flush=True)
                     score("raking",
                           eval_raking(samp, eval_areas, demographics, ps_frames, y_col),
                           eval_areas, size, bias, seed)
+                    print(f"[grid] size={size} bias={bias} seed={seed}: "
+                          f"fitting mrp (MixedLM REML)...", flush=True)
                     score("mrp",
                           eval_mrp(samp, eval_areas, demographics, ps_frames, y_col),
                           eval_areas, size, bias, seed)

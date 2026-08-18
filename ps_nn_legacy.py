@@ -31,6 +31,7 @@ Architecture, unchanged:
 from __future__ import annotations
 from copy import deepcopy
 from typing import List, Dict, Tuple
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -135,6 +136,7 @@ def train_ps_nn_legacy(
     total_decays = 0
     history = {"val_r": [], "val_mse": []}
 
+    t_start = time.time()
     for ep in range(epochs):
         model.train()
         optimizer.zero_grad()
@@ -155,6 +157,13 @@ def train_ps_nn_legacy(
         history["val_r"].append(val_r)
         history["val_mse"].append(val_mse)
 
+        elapsed = time.time() - t_start
+        print(f"  [ps_nn_legacy] epoch {ep + 1}/{epochs}  "
+              f"loss={loss.item():.4f}  val_r={val_r:.4f}  val_mse={val_mse:.4f}  "
+              f"best_val_r={best_val:.4f}  "
+              f"elapsed={elapsed:.1f}s  ({elapsed / (ep + 1):.2f}s/epoch)",
+              flush=True)
+
         if val_r > best_val:
             best_val = val_r
             best_state = deepcopy(model.state_dict())
@@ -164,11 +173,18 @@ def train_ps_nn_legacy(
             if no_improve > patience:
                 total_decays += 1
                 if total_decays > decays:
+                    print(f"  [ps_nn_legacy] early stop at epoch {ep + 1} "
+                          f"(no improvement, out of decays)", flush=True)
                     break
                 model.load_state_dict(best_state)
                 for g in optimizer.param_groups:
                     g["lr"] /= 10
                 no_improve = 0
+                print(f"  [ps_nn_legacy] epoch {ep + 1}: no improvement, "
+                      f"decaying lr to {optimizer.param_groups[0]['lr']:.2e} "
+                      f"(decay {total_decays}/{decays})", flush=True)
 
     model.load_state_dict(best_state)
+    print(f"  [ps_nn_legacy] done: best_val_r={best_val:.4f} "
+          f"over {len(history['val_r'])} epochs", flush=True)
     return model, history
