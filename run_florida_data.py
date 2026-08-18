@@ -94,15 +94,19 @@ def main():
     # ONE pass, full data, no subsampling, no injected selection bias, no
     # search grid -- size=1.0/bias=0.0 is a single cell, not a sweep. Only
     # naive/raking/mrp + ps_nn_legacy run; DeepMRP configs and hybrid_mrp
-    # stay off. ps_nn_legacy still needs an internal 80/20 train/val split
-    # to train + score itself -- run_grid scores naive/raking/mrp on that
-    # SAME held-out 20% rather than on every area, so the comparison across
-    # methods stays apples-to-apples (see run_grid's `needs_split` comment).
+    # stay off. cv_folds=10 -> ps_nn_legacy trains 10 independent models (one
+    # per fold) and every kept area gets scored exactly once, pooled across
+    # folds, instead of only the 20% held out by a single random split.
+    # naive/raking/mrp are scored on that same full pooled set, so every
+    # method in the comparison sees the same areas (see run_grid's
+    # `needs_split`/cv_folds docstring). Costs ~10x the ps_nn_legacy training
+    # compute of a single split -- up to 100 epochs x 10 folds.
     df = run_grid(
         pop_df, dem_cols, ps_frames, device,
         sizes=(1.0,), biases=(0.0,), seeds=(0,),
         include_classical=True, include_deep=False,
         include_legacy=True, include_hybrid=False,
+        cv_folds=10,
         area_target=area_target,
     )
     print(df[["method", "r", "mse", "n"]].sort_values("method")
