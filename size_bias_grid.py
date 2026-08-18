@@ -101,10 +101,13 @@ def eval_naive(samp_df, areas, y_col="y"):
 
 
 def eval_raking(samp_df, areas, demographics, ps_frames, y_col="y"):
+    # group once instead of re-scanning samp_df per area -- see the comment
+    # in _featurize_from_df for why this matters at census-block scale.
+    groups = dict(iter(samp_df.groupby("area", sort=False)))
     out = []
     for a in areas:
-        sub = samp_df[samp_df.area == a]
-        if len(sub) == 0:
+        sub = groups.get(a)
+        if sub is None or len(sub) == 0:
             out.append(np.nan); continue
         out.append(raking_estimate(sub, demographics, ps_frames[a], y_col=y_col))
     return np.array(out)
@@ -112,8 +115,8 @@ def eval_raking(samp_df, areas, demographics, ps_frames, y_col="y"):
 
 def eval_mrp(samp_df, areas, demographics, ps_frames, y_col="y"):
     samp_grand = samp_df[y_col].mean()
-    area_off = {a: (samp_df[samp_df.area == a][y_col].mean() - samp_grand)
-                for a in areas}
+    area_means = samp_df.groupby("area")[y_col].mean()
+    area_off = {a: area_means.get(a, np.nan) - samp_grand for a in areas}
     mrp = MRPMixedLM(demographics, spatial_group="area",
                      area_random_effect=False).fit(samp_df, y_col=y_col)
     out = []
@@ -135,13 +138,22 @@ def _featurize_from_df(samp_df, areas, demographics, ps_frames, device,
     same per-dem census_frac / sample-count / one-hot ingredients computed in
     this one pass, so DeepMRP and the legacy PS_NN see identical inputs."""
     cats = {d: sorted(samp_df[d].unique()) for d in demographics}
+    idxs = {d: {c: i for i, c in enumerate(cats[d])} for d in demographics}
+    # group once instead of re-scanning samp_df per area: the old
+    # `samp_df[samp_df.area == a]` inside this loop is a full O(len(samp_df))
+    # scan on EVERY area, i.e. O(areas * len(samp_df)) overall. That's fine
+    # at county scale (~2-3k areas) but is a many-trillion-comparison
+    # operation at census-block scale (~270k areas over a multi-million-row
+    # sample) and never finishes in practice.
+    groups = {a: g for a, g in samp_df.groupby("area", sort=False)}
+
     # build per-area structures
     user_scores, census_counts, samp_counts, user_embs, targets = [], [], [], [], []
     legacy_areas = []
     kept_areas = []
     for a in areas:
-        sub = samp_df[samp_df.area == a]
-        if len(sub) < 2:
+        sub = groups.get(a)
+        if sub is None or len(sub) < 2:
             continue
         kept_areas.append(a)
         scores = sub[y_col].to_numpy()
@@ -151,16 +163,19 @@ def _featurize_from_df(samp_df, areas, demographics, ps_frames, device,
         psf = ps_frames[a]
         for d in demographics:
             k = len(cats[d])
-            idx = {c: i for i, c in enumerate(cats[d])}
+            idx = idxs[d]
             # user one-hot
             oh = np.zeros((len(sub), k))
             for i, v in enumerate(sub[d].to_numpy()):
                 oh[i, idx[v]] = 1.0
             embs.append(oh)
-            # census counts from ps frame (sum census_frac within each category)
+            # census counts from ps frame (sum census_frac within each
+            # category) -- vectorised instead of psf.iterrows(), which
+            # re-pays per-row Series construction overhead on every one of
+            # the (up to hundreds of thousands of) kept areas.
             cc = np.zeros(k)
-            for _, row in psf.iterrows():
-                cc[idx[row[d]]] += row["census_frac"]
+            for b, frac in zip(psf[d].to_numpy(), psf["census_frac"].to_numpy()):
+                cc[idx[b]] += frac
             c_counts.append(cc)
             # sample counts
             sc = oh.sum(0)
