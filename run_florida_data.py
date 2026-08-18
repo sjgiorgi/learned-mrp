@@ -22,7 +22,7 @@ import pandas as pd
 import torch
 
 from adapter import build_dataset
-from size_bias_grid import run_grid, summarize
+from size_bias_grid import run_grid
 
 DATA_DIR = "election_data"
 SPATIAL_GROUP = "GEOID20"
@@ -91,17 +91,22 @@ def main():
     )
     print(f"pop_df: {pop_df.shape}, areas: {len(ps_frames)}, dem cols: {dem_cols}")
 
-    # naive/raking/mrp + ps_nn_legacy -- skip DeepMRP (classical_mrp/
-    # full_deep_mrp) and hybrid_mrp, the expensive neural sweeps.
+    # ONE pass, full data, no subsampling, no injected selection bias, no
+    # search grid -- size=1.0/bias=0.0 is a single cell, not a sweep. Only
+    # naive/raking/mrp + ps_nn_legacy run; DeepMRP configs and hybrid_mrp
+    # stay off. ps_nn_legacy still needs an internal 80/20 train/val split
+    # to train + score itself -- run_grid scores naive/raking/mrp on that
+    # SAME held-out 20% rather than on every area, so the comparison across
+    # methods stays apples-to-apples (see run_grid's `needs_split` comment).
     df = run_grid(
         pop_df, dem_cols, ps_frames, device,
-        sizes=(0.05, 0.3), biases=(0.0, 3.0), seeds=(0,),
+        sizes=(1.0,), biases=(0.0,), seeds=(0,),
         include_classical=True, include_deep=False,
         include_legacy=True, include_hybrid=False,
         area_target=area_target,
     )
-    print(summarize(df).pivot_table(index=["size", "bias"], columns="method",
-                                     values="r_mean").round(3))
+    print(df[["method", "r", "mse", "n"]].sort_values("method")
+          .to_string(index=False))
 
 
 if __name__ == "__main__":
