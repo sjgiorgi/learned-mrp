@@ -91,14 +91,18 @@ def main():
     )
     print(f"pop_df: {pop_df.shape}, areas: {len(ps_frames)}, dem cols: {dem_cols}")
 
-    # small/fast grid first -- proves the real-data path works end to end
-    # before committing to the full sweep.
+    # mrp + ps_nn_legacy only -- skip DeepMRP (classical_mrp/full_deep_mrp)
+    # and hybrid_mrp, the expensive neural sweeps. naive/raking ride along
+    # for free (cheap groupby ops) since include_classical can't isolate mrp
+    # alone; they're dropped from the printed table below.
     df = run_grid(
         pop_df, dem_cols, ps_frames, device,
         sizes=(0.05, 0.3), biases=(0.0, 3.0), seeds=(0,),
-        deepmrp_configs=("classical_mrp", "full_deep_mrp"),
+        include_classical=True, include_deep=False,
+        include_legacy=True, include_hybrid=False,
         area_target=area_target,
     )
+    df = df[df["method"].isin(["mrp", "ps_nn_legacy"])]
     print(summarize(df).pivot_table(index=["size", "bias"], columns="method",
                                      values="r_mean").round(3))
 
