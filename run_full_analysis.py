@@ -114,6 +114,18 @@ def parse_args():
                     help="training loss for DeepMRP and ps_nn_legacy. 'pearson' is what every "
                          "actual notebook training call used; 'mse' is what the paper's Eq. 9 "
                          "describes -- untested which one produced the reported numbers")
+    p.add_argument("--device", default="cpu",
+                    help="torch device. CPU by default: ps_nn_legacy's per-area Python loop is "
+                         "kernel-launch bound on tiny tensors, so a GPU is slower, not faster "
+                         "(~3.5x slower measured on MPS). Pass 'cuda' to use a GPU anyway")
+    p.add_argument("--multitask", action="store_true",
+                    help="run all --outcomes together in ONE grid (same areas, same folds) and "
+                         "train several ps_nn_legacy models, each scored on EVERY outcome: one "
+                         "on all outcomes (shared weights), one per single outcome, and (with 3+ "
+                         "outcomes) one per leave-one-outcome-out set. Scores on outcomes a "
+                         "model never trained on are flagged transfer=True. Supports "
+                         "naive/raking/mrp + ps_nn_legacy only; DeepMRP/hybrid_mrp are dropped. "
+                         "Writes results/multitask_raw.csv")
     return p.parse_args()
 
 
@@ -127,6 +139,43 @@ def load_real_data():
     census["cnty"] = census["cnty"].astype(str).str.zfill(5)
 
     return user.set_index("cnty"), outcome.set_index("cnty"), census.set_index("cnty")
+
+
+def multitask_tables(summ: pd.DataFrame, targets) -> str:
+    """Two compact r tables from one (size, bias) slice of summarize(df).
+
+    1. headline, rows = outcome scored:
+         naive / raking / mrp      classical, fit on that outcome
+         single                    ps_nn trained on that outcome only
+         multi                     ps_nn trained on all outcomes (shared weights)
+         loo_transfer              ps_nn trained on every OTHER outcome (zero-shot)
+         single_transfer_mean      mean over the single-task models of the
+                                   other outcomes (zero-shot)
+    2. single-task transfer matrix: rows = outcome trained on, cols = outcome
+       scored; the diagonal is each model's own outcome, off-diagonal is
+       zero-shot transfer."""
+    r = summ.set_index(["method", "task"])["r_mean"]
+    get = lambda m, t: r.get((m, t), np.nan)
+    single = lambda t: f"ps_nn_legacy[train={t}]"
+    loo = lambda t: "ps_nn_legacy[train=" + "+".join(o for o in targets if o != t) + "]"
+
+    rows = {}
+    for t in targets:
+        others = [o for o in targets if o != t]
+        rows[t] = {
+            "naive": get("naive", t), "raking": get("raking", t), "mrp": get("mrp", t),
+            "single": get(single(t), t),
+            "multi": get("ps_nn_legacy[train=all]", t),
+            "loo_transfer": get(loo(t), t) if len(targets) >= 3 else np.nan,
+            "single_transfer_mean": np.nanmean([get(single(o), t) for o in others]),
+        }
+    # loo_transfer is all-NaN with only 2 outcomes (leave-one-out == single)
+    headline = pd.DataFrame.from_dict(rows, orient="index").dropna(axis=1, how="all")
+    matrix = pd.DataFrame({t: [get(single(o), t) for o in targets] for t in targets},
+                          index=[f"trained on {o}" for o in targets])
+    return (f"r by outcome scored:\n{headline.round(3).to_string()}\n\n"
+            f"single-task transfer (rows = trained on, cols = scored on):\n"
+            f"{matrix.round(3).to_string()}")
 
 
 def main():
@@ -144,12 +193,23 @@ def main():
     include_legacy = "ps_nn_legacy" in args.methods
     include_hybrid = "hybrid_mrp" in args.methods
 
+    if args.multitask:
+        if len(outcome_pairs) < 2:
+            raise SystemExit("--multitask needs at least 2 --outcomes")
+        if include_deep or include_hybrid:
+            print("--multitask: dropping DeepMRP/hybrid_mrp (single-task only)", flush=True)
+        deepmrp_configs, include_deep, include_hybrid = (), False, False
+        targets = [t for _, t in outcome_pairs]
+        train_sets = [targets] + [[t] for t in targets]
+        if len(targets) >= 3:
+            train_sets += [[o for o in targets if o != t] for t in targets]
+
     cv_folds = args.cv_folds if args.cv_folds > 0 else None
     seeds = tuple(range(args.rounds))
     sizes = tuple(args.sizes)
     biases = tuple(args.biases)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device)
     print(f"device: {device}", flush=True)
     print(f"sizes: {sizes}  biases: {biases}", flush=True)
     print(f"outcomes: {args.outcomes}", flush=True)
@@ -160,17 +220,51 @@ def main():
     print(f"cv_folds={cv_folds}  rounds={args.rounds} (seeds={seeds})  "
           f"loss_type={args.loss_type}", flush=True)
 
-    n_cells = len(sizes) * len(biases) * len(outcome_pairs) * len(seeds)
-    n_neural_methods = len(deepmrp_configs) + (1 if include_legacy else 0) + (1 if include_hybrid else 0)
     effective_folds = cv_folds if cv_folds else 1
-    n_trainings = n_cells * effective_folds * n_neural_methods
-    print(f"grid: {len(sizes)} sizes x {len(biases)} biases x {len(outcome_pairs)} "
-          f"outcomes x {len(seeds)} round(s) = {n_cells} cells "
-          f"-> ~{n_trainings} total neural trainings", flush=True)
+    if args.multitask:
+        n_cells = len(sizes) * len(biases) * len(seeds)
+        n_trainings = n_cells * effective_folds * (len(train_sets) if include_legacy else 0)
+        print(f"multitask grid: {len(sizes)} sizes x {len(biases)} biases x "
+              f"{len(seeds)} round(s) = {n_cells} cells, {len(train_sets) if include_legacy else 0} "
+              f"ps_nn_legacy models per fold -> ~{n_trainings} total neural trainings",
+              flush=True)
+    else:
+        n_cells = len(sizes) * len(biases) * len(outcome_pairs) * len(seeds)
+        n_neural_methods = len(deepmrp_configs) + (1 if include_legacy else 0) + (1 if include_hybrid else 0)
+        n_trainings = n_cells * effective_folds * n_neural_methods
+        print(f"grid: {len(sizes)} sizes x {len(biases)} biases x {len(outcome_pairs)} "
+              f"outcomes x {len(seeds)} round(s) = {n_cells} cells "
+              f"-> ~{n_trainings} total neural trainings", flush=True)
 
     print("loading CSVs...", flush=True)
     USER, OUTCOME, CENSUS = load_real_data()
     print(f"USER {USER.shape} | OUTCOME {OUTCOME.shape} | CENSUS {CENSUS.shape}", flush=True)
+
+    if args.multitask:
+        t0 = time.time()
+        pop_df, ps_frames, area_target, dem_cols = build_dataset(
+            USER, OUTCOME, CENSUS, demographics, twitter_bins, census_table_cols,
+            spatial_group="cnty", tasks=outcome_pairs,
+        )
+        print(f"pop_df: {pop_df.shape}, areas: {len(ps_frames)}, dem_cols: {dem_cols}",
+              flush=True)
+        df = run_grid(
+            pop_df, dem_cols, ps_frames, device,
+            sizes=sizes, biases=biases, seeds=seeds,
+            include_classical=include_classical, include_deep=False,
+            include_legacy=include_legacy, include_hybrid=False,
+            cv_folds=cv_folds, loss_type=args.loss_type,
+            area_target=area_target, tasks=outcome_pairs,
+            legacy_train_sets=train_sets,
+        )
+        out_path = f"{OUT_DIR}/multitask_raw.csv"
+        df.to_csv(out_path, index=False)
+        print(f"saved {out_path}  ({len(df)} rows, {(time.time() - t0) / 60:.1f} min)",
+              flush=True)
+        for (size, bias), g in summarize(df).groupby(["size", "bias"]):
+            print(f"\n{'='*70}\nsize={size}, bias={bias}\n{'='*70}")
+            print(multitask_tables(g, targets), flush=True)
+        return
 
     all_dfs = []
     for person_outcome, area_target_col in outcome_pairs:
