@@ -23,7 +23,7 @@ the census columns named in CENSUS_TABLE_COLS.
 """
 
 from __future__ import annotations
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 import itertools
 import numpy as np
 import pandas as pd
@@ -76,6 +76,12 @@ def build_ps_frame(marg: Dict[str, np.ndarray],
     return df
 
 
+def task_y_col(proxy: str) -> str:
+    """pop_df column holding person-level proxy `proxy` in multitask mode.
+    Must stay a valid formula identifier -- MRPMixedLM fits f'{y_col} ~ 1'."""
+    return f"y__{proxy}"
+
+
 def build_dataset(
     user_df: pd.DataFrame,
     outcome_df: pd.DataFrame,
@@ -84,9 +90,10 @@ def build_dataset(
     twitter_bins: Dict[str, list],
     census_table_cols: Dict[str, list],
     spatial_group: str,
-    person_outcome: str,          # e.g. 'SWB_LADDER' or 'registered_repub'
-    area_target_col: str,         # e.g. 'ladder' or 'repub_perc'
+    person_outcome: Optional[str] = None,   # e.g. 'SWB_LADDER' or 'registered_repub'
+    area_target_col: Optional[str] = None,  # e.g. 'ladder' or 'repub_perc'
     reliability_col: Optional[str] = None,
+    tasks: Optional[Sequence[Tuple[str, str]]] = None,
 ):
     """Returns (pop_df, ps_frames, area_target).
 
@@ -96,24 +103,57 @@ def build_dataset(
                       (e.g. SWB_LADDER -> ladder); for VOTING it differs
                       (registered_repub -> repub_perc), which is the
                       cross-construct case.
+    tasks           : multitask alternative to the two args above -- a list of
+                      (person_outcome, area_target_col) pairs, e.g.
+                      [('registered_repub', 'repub2020_perc_block'),
+                       ('registered_repub', 'repub2016_perc_block')].
+                      Proxies may repeat across tasks. Each distinct proxy
+                      becomes pop_df[task_y_col(proxy)] (no 'y' column), and
+                      area_target maps area -> float array of length
+                      len(tasks), NaN where that task's target is missing.
+                      Areas are kept if ANY task has a target; the loss and
+                      scoring mask NaNs per task. Pass the same `tasks` to
+                      run_grid.
     """
+    if tasks is not None:
+        if person_outcome is not None or area_target_col is not None:
+            raise ValueError("pass either tasks or person_outcome/area_target_col")
+        if len(tasks) == 0:
+            raise ValueError("tasks is empty")
+        proxies = list(dict.fromkeys(p for p, _ in tasks))
+        renames = {p: task_y_col(p) for p in proxies}
+    else:
+        if person_outcome is None or area_target_col is None:
+            raise ValueError("person_outcome and area_target_col are required "
+                             "when tasks is not given")
+        proxies = [person_outcome]
+        renames = {person_outcome: "y"}
+
     dem_bin_cols = [f"{d}_bin" for d in demographics]
 
     # --- person-level flat frame ---
     binned = bin_users(user_df.reset_index(), demographics, twitter_bins)
-    keep_cols = [spatial_group] + dem_bin_cols + [person_outcome]
+    keep_cols = [spatial_group] + dem_bin_cols + proxies
     if reliability_col is not None and reliability_col in binned.columns:
         keep_cols.append(reliability_col)
-    pop = binned[keep_cols].dropna(subset=dem_bin_cols + [person_outcome]).copy()
-    pop = pop.rename(columns={spatial_group: "area", person_outcome: "y"})
+    pop = binned[keep_cols].dropna(subset=dem_bin_cols + proxies).copy()
+    pop = pop.rename(columns={spatial_group: "area", **renames})
     pop[dem_bin_cols] = pop[dem_bin_cols].astype(int)
 
     # --- area target (ground truth), sourced from outcome_df ---
     # drop areas with a missing/NaN ground truth -- a NaN target poisons the
     # batched training loss (pearson_loss is computed jointly over the batch)
     # and crashes scoring, so it must be filtered here rather than downstream.
-    target_col = outcome_df[area_target_col]
-    area_target = target_col[target_col.notna()].to_dict()
+    # Multitask keeps an area if any task has a target; the per-task NaNs
+    # left behind are masked in the loss and in scoring instead.
+    if tasks is not None:
+        targets = outcome_df[[t for _, t in tasks]].to_numpy(dtype=float)
+        has_any = ~np.isnan(targets).all(axis=1)
+        area_target = {a: targets[i]
+                       for i, a in enumerate(outcome_df.index) if has_any[i]}
+    else:
+        target_col = outcome_df[area_target_col]
+        area_target = target_col[target_col.notna()].to_dict()
 
     # --- ps_frames: only for areas present in BOTH user and census ---
     ps_frames = {}

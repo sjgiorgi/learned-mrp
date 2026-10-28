@@ -30,7 +30,7 @@ Architecture, unchanged:
 """
 from __future__ import annotations
 from copy import deepcopy
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Sequence, Tuple
 import time
 import numpy as np
 import torch
@@ -86,15 +86,22 @@ class PS_NN(nn.Module):
 
     def forward(self, legacy_areas: List[Dict]) -> torch.Tensor:
         """legacy_areas: list of per-county dicts with keys:
-             user_scores          (u,)
+             user_scores          (u,) single-task, or (u, T) multitask
              census_bin_percents  [ (k_d,) per demographic, sums to 1 ]
              twitter_bin_counts   [ (k_d,) per demographic, RAW sample counts ]
              user_dem_embeddings  [ (u, k_d) one-hot per demographic ]
+
+        Returns (n_areas,) single-task or (n_areas, T) multitask. Multitask
+        shares ONE set of weights per county across all T tasks: the weights
+        depend only on demographics/census, never on the outcome, so each
+        task's column of user_scores is averaged with the same weights.
         """
         county_weighted_avgs = []
         for area in legacy_areas:
             user_weights = self.compute_weights(area)
-            county_weighted_avg = (user_weights * area["user_scores"]).sum() / user_weights.sum()
+            scores = area["user_scores"]
+            w = user_weights[:, None] if scores.dim() == 2 else user_weights
+            county_weighted_avg = (w * scores).sum(0) / user_weights.sum()
             county_weighted_avgs.append(county_weighted_avg)
 
         return torch.stack(county_weighted_avgs)
@@ -104,6 +111,39 @@ def infer_num_factors(legacy_areas: List[Dict]) -> int:
     return sum(t.shape[0] for t in legacy_areas[0]["census_bin_percents"])
 
 
+def _loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str) -> torch.Tensor:
+    """Single-task: the plain loss. Multitask ((n, T) pred/target): the mean
+    of the per-task losses, each over only the areas where that task's
+    target is non-NaN (targets can have different area coverage)."""
+    if loss_type == "pearson":
+        fn = pearson_loss
+    elif loss_type == "mse":
+        fn = F.mse_loss
+    else:
+        raise ValueError(loss_type)
+    if pred.dim() == 1:
+        return fn(pred, target)
+    losses = []
+    for t in range(pred.shape[1]):
+        m = ~torch.isnan(target[:, t])
+        losses.append(fn(pred[m, t], target[m, t]))
+    return torch.stack(losses).mean()
+
+
+def _task_metrics(pred: np.ndarray, target: np.ndarray):
+    """(r, mse) single-task; the mean over tasks of the NaN-masked per-task
+    (r, mse) multitask -- one number each, so early stopping / LR decay pick
+    the checkpoint that is best across all tasks together."""
+    if pred.ndim == 1:
+        return _metrics(pred, target)
+    rs, mses = [], []
+    for t in range(pred.shape[1]):
+        m = ~np.isnan(target[:, t])
+        r, mse = _metrics(pred[m, t], target[m, t])
+        rs.append(r); mses.append(mse)
+    return float(np.mean(rs)), float(np.mean(mses))
+
+
 def train_ps_nn_legacy(
     model: PS_NN,
     train_areas: List[Dict], y_train: np.ndarray,
@@ -111,6 +151,7 @@ def train_ps_nn_legacy(
     device: torch.device,
     epochs: int = 100, lr: float = 0.5, patience: int = 3, decays: int = 1,
     loss_type: str = "pearson", seed: int = 0,
+    train_tasks: Optional[Sequence[int]] = None,
 ) -> Tuple[PS_NN, dict]:
     """Matches notebook_NeurIPS.ipynb's train_model exactly: gradients only
     ever touch train_areas, val_areas only pick the best checkpoint -- AND
@@ -124,11 +165,23 @@ def train_ps_nn_legacy(
     used) or "mse" (what the paper's Eq. 9 describes as the loss -- the code
     and the paper text disagree on this, and it's untested which one
     actually produced Table 2's numbers). Mirrors train_deepmrp's loss_type
-    so DeepMRP and ps_nn_legacy can be compared under the same loss."""
+    so DeepMRP and ps_nn_legacy can be compared under the same loss.
+
+    Multitask: pass (n, T) y_train/y_val (NaN = missing target) alongside
+    (u, T) user_scores. The loss is the mean of per-task losses and val_r /
+    val_mse are means over tasks; with 1-D targets this is exactly the
+    single-task path. train_tasks: optional column indices -- the loss AND
+    checkpoint selection see only those tasks, so the others' targets are
+    never touched in training (the model still outputs every column, which
+    is what makes held-out-outcome transfer scoring possible)."""
     set_seed(seed)
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     yt = torch.tensor(y_train, dtype=torch.float32, device=device)
+    y_val = np.asarray(y_val)
+    cols = list(train_tasks) if train_tasks is not None else None
+    if cols is not None:
+        yt, y_val = yt[:, cols], y_val[:, cols]
 
     best_val = -np.inf
     best_state = deepcopy(model.state_dict())
@@ -141,19 +194,18 @@ def train_ps_nn_legacy(
         model.train()
         optimizer.zero_grad()
         pred = model(train_areas)
-        if loss_type == "pearson":
-            loss = pearson_loss(pred, yt)
-        elif loss_type == "mse":
-            loss = F.mse_loss(pred, yt)
-        else:
-            raise ValueError(loss_type)
+        if cols is not None:
+            pred = pred[:, cols]
+        loss = _loss(pred, yt, loss_type)
         loss.backward()
         optimizer.step()
 
         model.eval()
         with torch.no_grad():
             vp = model(val_areas).cpu().numpy()
-        val_r, val_mse = _metrics(vp, np.asarray(y_val))
+        if cols is not None:
+            vp = vp[:, cols]
+        val_r, val_mse = _task_metrics(vp, y_val)
         history["val_r"].append(val_r)
         history["val_mse"].append(val_mse)
 

@@ -25,13 +25,14 @@ ready for a heatmap or a LaTeX table.
 """
 
 from __future__ import annotations
-from typing import List, Dict, Callable, Optional
+from typing import List, Dict, Callable, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
 from scipy.stats import pearsonr
 from sklearn.metrics import mean_squared_error
 
+from adapter import task_y_col
 from mrp_baseline import MRPMixedLM, MRPCellMeans, raking_estimate
 from deep_mrp import DeepMRP, ablation_config
 from featurize import build_area_batches, infer_dims
@@ -136,7 +137,9 @@ def _featurize_from_df(samp_df, areas, demographics, ps_frames, device,
     expects (for DeepMRP), plus the per-demographic (unconcatenated) legacy
     structures ps_nn_legacy.PS_NN expects -- both are built from the exact
     same per-dem census_frac / sample-count / one-hot ingredients computed in
-    this one pass, so DeepMRP and the legacy PS_NN see identical inputs."""
+    this one pass, so DeepMRP and the legacy PS_NN see identical inputs.
+    y_col may be a list of columns (multitask) -> user_scores are (u, T);
+    only the legacy PS_NN consumes that shape."""
     cats = {d: sorted(samp_df[d].unique()) for d in demographics}
     idxs = {d: {c: i for i, c in enumerate(cats[d])} for d in demographics}
     # group once instead of re-scanning samp_df per area: the old
@@ -290,7 +293,8 @@ def eval_deepmrp(samp_df, full_truth, areas, demographics, ps_frames, device,
 
 def eval_ps_nn_legacy(samp_df, full_truth, areas, demographics, ps_frames, device,
                       seed=0, y_col="y", epochs=100,
-                      precomputed=None, split=None, loss_type="pearson"):
+                      precomputed=None, split=None, loss_type="pearson",
+                      train_tasks=None):
     """The literal original PS_NN model (ps_nn_legacy.py), not DeepMRP's
     approximation of it. Same train/val discipline as eval_deepmrp: gradients
     only touch the 80% train split, scoring only happens on the held-out 20%.
@@ -320,12 +324,14 @@ def eval_ps_nn_legacy(samp_df, full_truth, areas, demographics, ps_frames, devic
     model = PS_NN(num_factors=num_factors, num_dem=len(demographics))
     model, _ = train_ps_nn_legacy(model, tr_a, tr_y, va_a, va_y, device,
                                   epochs=epochs, patience=3, seed=seed,
-                                  loss_type=loss_type)
+                                  loss_type=loss_type, train_tasks=train_tasks)
     model.eval()
     with torch.no_grad():
         preds = model(va_a).cpu().numpy()
     held_out = [kept[i] for i in val_idx]
-    est = {a: float(preds[i]) for i, a in enumerate(held_out)}
+    # multitask: full_truth values and preds rows are length-T arrays
+    est = {a: preds[i] if preds.ndim == 2 else float(preds[i])
+           for i, a in enumerate(held_out)}
     return est, held_out
 
 
@@ -383,7 +389,9 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
              include_hybrid=True,
              area_target: Optional[Dict] = None,
              loss_type: str = "pearson",
-             cv_folds: Optional[int] = None) -> pd.DataFrame:
+             cv_folds: Optional[int] = None,
+             tasks: Optional[Sequence[Tuple[str, str]]] = None,
+             legacy_train_sets: Optional[Sequence[Sequence[str]]] = None) -> pd.DataFrame:
     """area_target: optional {area -> ground-truth value}. If given, methods are
     scored against THIS (e.g. true vote share from the outcome file -- the
     cross-construct case). If None, ground truth is the full-sample mean of y
@@ -401,9 +409,62 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
         holdout. `seed` still controls the (reproducible) fold assignment,
         so multiple `seeds` with cv_folds set gives repeated k-fold CV. Costs
         roughly k times the compute of a single-split run, since k models get
-        trained per cell instead of 1."""
+        trained per cell instead of 1.
+    tasks: optional list of (person_outcome, area_target_col) pairs -- the
+        SAME list passed to adapter.build_dataset(tasks=...), along with its
+        area_target. With 2+ tasks, ps_nn_legacy trains ONE model whose
+        per-county weights are shared across all tasks (mean of per-task
+        losses); naive/raking/mrp are fit separately per task, the
+        single-task comparison. Results get a `task` column (the target
+        column name), one row per method x task. DeepMRP and hybrid_mrp are
+        single-task only. A single-tuple `tasks` runs the exact single-task
+        path, just with the `task` column added.
+    legacy_train_sets: optional list of target-name lists (multitask only).
+        Trains one ps_nn_legacy per set, each seeing ONLY its set's targets in
+        its loss and checkpoint selection, but scored on EVERY task -- e.g.
+        [['ladder'], ['depression', 'worry', 'happy']] gives a ladder-only
+        model and a leave-ladder-out model, each scored on all four outcomes.
+        Every model shares the same areas and folds. Methods are named
+        'ps_nn_legacy[train=a+b]' ('ps_nn_legacy[train=all]' for the full
+        set), and a `transfer` column marks rows whose task was NOT in that
+        model's training set (always False for classical methods). Default:
+        one model on all tasks."""
+    if tasks is not None:
+        if area_target is None:
+            raise ValueError("tasks requires area_target from build_dataset(tasks=...)")
+        y_cols = [task_y_col(p) for p, _ in tasks]
+        task_names = [t for _, t in tasks]
+        if len(tasks) > 1 and (include_deep or include_hybrid):
+            raise ValueError("multitask runs support ps_nn_legacy and the classical "
+                             "methods only; set include_deep=False, include_hybrid=False")
+    else:
+        y_cols = [y_col]
+        task_names = [None]
+    n_tasks = len(y_cols)
+    # (method name, task-column indices it trains on) per ps_nn_legacy model
+    if n_tasks == 1:
+        legacy_models = [("ps_nn_legacy", None)]
+    else:
+        if legacy_train_sets is None:
+            legacy_train_sets = [task_names]
+        if len(set(task_names)) != n_tasks:
+            raise ValueError("multitask target columns must be unique")
+        legacy_models = []
+        for ts in legacy_train_sets:
+            unknown = set(ts) - set(task_names)
+            if unknown or not ts:
+                raise ValueError(f"bad legacy_train_sets entry {ts}: unknown {unknown}")
+            idx = [task_names.index(t) for t in ts]
+            label = "all" if set(ts) == set(task_names) else "+".join(ts)
+            legacy_models.append((f"ps_nn_legacy[train={label}]", sorted(idx)))
+    # featurize with a plain column name when single-task so the neural
+    # methods see (u,) scores and scalar targets, exactly as before
+    feat_y = y_cols[0] if n_tasks == 1 else y_cols
+
     if area_target is not None:
         truth_arr = dict(area_target)
+        if tasks is not None and n_tasks == 1:
+            truth_arr = {a: float(np.asarray(v)[0]) for a, v in truth_arr.items()}
         areas = sorted(truth_arr.keys())
     else:
         truth = area_ground_truth(pop_df, y_col)
@@ -412,16 +473,22 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
 
     records = []
 
-    def score(name, est_arr, eval_areas, size, bias, seed):
+    def score(name, est_arr, eval_areas, size, bias, seed, task=0, transfer=False):
         est_arr = np.asarray(est_arr, dtype=float)
-        t = np.array([truth_arr[a] for a in eval_areas], dtype=float)
+        t = np.array([np.atleast_1d(truth_arr[a])[task] for a in eval_areas],
+                     dtype=float)
         mask = ~np.isnan(est_arr) & ~np.isnan(t)
         if mask.sum() < 5:
             return
         r = pearsonr(est_arr[mask], t[mask])[0]
         mse = mean_squared_error(t[mask], est_arr[mask])
-        records.append(dict(size=size, bias=bias, seed=seed,
-                            method=name, r=r, mse=mse, n=int(mask.sum())))
+        rec = dict(size=size, bias=bias, seed=seed, method=name)
+        if tasks is not None:
+            rec["task"] = task_names[task]
+            if n_tasks > 1:
+                rec["transfer"] = transfer
+        rec.update(r=r, mse=mse, n=int(mask.sum()))
+        records.append(rec)
 
     needs_split = include_deep or include_legacy or include_hybrid
 
@@ -458,7 +525,7 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                 precomputed = None
                 eval_areas = areas
                 deep_est = {cfg: {} for cfg in deepmrp_configs}
-                legacy_est = {}
+                legacy_est = {name: {} for name, _ in legacy_models}
                 hybrid_est = {}
 
                 if needs_split:
@@ -466,7 +533,7 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                           f"featurizing (grouping {len(samp)} rows by area)...",
                           flush=True)
                     precomputed = _featurize_from_df(samp, areas, demographics,
-                                                      ps_frames, device, y_col=y_col)
+                                                      ps_frames, device, y_col=feat_y)
                     kept = precomputed[2]
                     print(f"[grid] size={size} bias={bias} seed={seed}: "
                           f"{len(kept)} areas kept for train/val", flush=True)
@@ -490,28 +557,29 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                                 for cfg in deepmrp_configs:
                                     est_map, _ = eval_deepmrp(
                                         samp, truth_arr, areas, demographics, ps_frames,
-                                        device, config_name=cfg, seed=fold_seed, y_col=y_col,
+                                        device, config_name=cfg, seed=fold_seed, y_col=feat_y,
                                         precomputed=precomputed, split=(tr_idx, val_idx),
                                         loss_type=loss_type)
                                     deep_est[cfg].update(est_map)
 
                             if include_legacy:
-                                print(f"[grid] size={size} bias={bias} seed={seed} "
-                                      f"fold={fold_i}: training ps_nn_legacy...",
-                                      flush=True)
-                                est_map, _ = eval_ps_nn_legacy(
-                                    samp, truth_arr, areas, demographics, ps_frames,
-                                    device, seed=fold_seed, y_col=y_col,
-                                    precomputed=precomputed, split=(tr_idx, val_idx),
-                                    loss_type=loss_type)
-                                legacy_est.update(est_map)
-                                print(f"[grid] size={size} bias={bias} seed={seed} "
-                                      f"fold={fold_i}: ps_nn_legacy done", flush=True)
+                                for lname, ltasks in legacy_models:
+                                    print(f"[grid] size={size} bias={bias} seed={seed} "
+                                          f"fold={fold_i}: training {lname}...",
+                                          flush=True)
+                                    est_map, _ = eval_ps_nn_legacy(
+                                        samp, truth_arr, areas, demographics, ps_frames,
+                                        device, seed=fold_seed, y_col=feat_y,
+                                        precomputed=precomputed, split=(tr_idx, val_idx),
+                                        loss_type=loss_type, train_tasks=ltasks)
+                                    legacy_est[lname].update(est_map)
+                                    print(f"[grid] size={size} bias={bias} seed={seed} "
+                                          f"fold={fold_i}: {lname} done", flush=True)
 
                             if include_hybrid:
                                 est_map, _ = eval_hybrid_mrp(
                                     samp, truth_arr, areas, demographics, ps_frames,
-                                    device, seed=fold_seed, y_col=y_col,
+                                    device, seed=fold_seed, y_col=feat_y,
                                     precomputed=precomputed, split=(tr_idx, val_idx),
                                     loss_type=loss_type)
                                 hybrid_est.update(est_map)
@@ -519,20 +587,26 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                         precomputed = None  # too few areas to train; fall back
 
                 if include_classical:
-                    print(f"[grid] size={size} bias={bias} seed={seed}: "
-                          f"scoring naive...", flush=True)
-                    score("naive", eval_naive(samp, eval_areas, y_col),
-                          eval_areas, size, bias, seed)
-                    print(f"[grid] size={size} bias={bias} seed={seed}: "
-                          f"scoring raking...", flush=True)
-                    score("raking",
-                          eval_raking(samp, eval_areas, demographics, ps_frames, y_col),
-                          eval_areas, size, bias, seed)
-                    print(f"[grid] size={size} bias={bias} seed={seed}: "
-                          f"fitting mrp (MixedLM REML)...", flush=True)
-                    score("mrp",
-                          eval_mrp(samp, eval_areas, demographics, ps_frames, y_col),
-                          eval_areas, size, bias, seed)
+                    # fit once per distinct proxy column -- tasks sharing a
+                    # proxy share the same classical estimates
+                    classical = {}
+                    for ti, yc in enumerate(y_cols):
+                        if yc not in classical:
+                            lbl = f" ({yc})" if n_tasks > 1 else ""
+                            print(f"[grid] size={size} bias={bias} seed={seed}: "
+                                  f"scoring naive{lbl}...", flush=True)
+                            naive_est = eval_naive(samp, eval_areas, yc)
+                            print(f"[grid] size={size} bias={bias} seed={seed}: "
+                                  f"scoring raking{lbl}...", flush=True)
+                            raking_est = eval_raking(samp, eval_areas, demographics,
+                                                     ps_frames, yc)
+                            print(f"[grid] size={size} bias={bias} seed={seed}: "
+                                  f"fitting mrp (MixedLM REML){lbl}...", flush=True)
+                            mrp_est = eval_mrp(samp, eval_areas, demographics,
+                                               ps_frames, yc)
+                            classical[yc] = (naive_est, raking_est, mrp_est)
+                        for name, est in zip(("naive", "raking", "mrp"), classical[yc]):
+                            score(name, est, eval_areas, size, bias, seed, task=ti)
 
                 if include_deep and precomputed is not None:
                     for cfg in deepmrp_configs:
@@ -540,8 +614,12 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
                         score(f"deep:{cfg}", est_arr, eval_areas, size, bias, seed)
 
                 if include_legacy and precomputed is not None:
-                    est_arr = [legacy_est.get(a, np.nan) for a in eval_areas]
-                    score("ps_nn_legacy", est_arr, eval_areas, size, bias, seed)
+                    for lname, ltasks in legacy_models:
+                        for ti in range(n_tasks):
+                            est_arr = [np.atleast_1d(legacy_est[lname].get(a, np.nan))[ti]
+                                       for a in eval_areas]
+                            score(lname, est_arr, eval_areas, size, bias, seed, task=ti,
+                                  transfer=ltasks is not None and ti not in ltasks)
 
                 if include_hybrid and precomputed is not None:
                     est_arr = [hybrid_est.get(a, np.nan) for a in eval_areas]
@@ -551,8 +629,9 @@ def run_grid(pop_df: pd.DataFrame, demographics: List[str],
 
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
-    """Average over seeds -> mean r per (size, bias, method)."""
-    return (df.groupby(["size", "bias", "method"])
+    """Average over seeds -> mean r per (size, bias, method[, task])."""
+    keys = ["size", "bias", "method"] + (["task"] if "task" in df.columns else [])
+    return (df.groupby(keys)
               .agg(r_mean=("r", "mean"), r_std=("r", "std"),
                    mse_mean=("mse", "mean"))
               .reset_index())
